@@ -637,10 +637,14 @@ itemInfo.Text = "Base: belum diset"
 itemInfo.Parent = itemPage
 
 -- Halaman Level (auto level up)
-local levelPage = Instance.new("Frame")
+local levelPage = Instance.new("ScrollingFrame")
 levelPage.Size = UDim2.new(1, -16, 1, -88)
 levelPage.Position = UDim2.new(0, 8, 0, 82)
 levelPage.BackgroundTransparency = 1
+levelPage.BorderSizePixel = 0
+levelPage.ScrollBarThickness = 4
+levelPage.CanvasSize = UDim2.new(0, 0, 0, 0)
+levelPage.AutomaticCanvasSize = Enum.AutomaticSize.Y
 levelPage.Visible = false
 levelPage.Parent = body
 do
@@ -684,9 +688,11 @@ end
 local multBox = inputRow(2, "Uang min (x harga box)", levelMult)
 local lvlBox = inputRow(3, "Level target unit", levelTarget)
 local protectBox = inputRow(4, "Unit teratas dilindungi", levelProtect)
+local calBox = inputRow(5, "Uang di layar (kalibrasi)", "")
+calBox.PlaceholderText = "598.05T"
 
 local levelInfo = Instance.new("TextLabel")
-levelInfo.LayoutOrder = 5
+levelInfo.LayoutOrder = 6
 levelInfo.Size = UDim2.new(1, -6, 0, 104)
 levelInfo.BackgroundTransparency = 1
 levelInfo.TextWrapped = true
@@ -1465,9 +1471,76 @@ local function parseCountdown(text)
     return nil
 end
 
--- uang pemain: atribut -> Value di bawah pemain (leaderstats) -> label PlayerGui bernama cash/money
+-- uang pemain: label uang yang tampil di layar (kiri bawah) -> atribut -> Value di bawah pemain
 local CASH_NAMES = { "cash", "money", "coins" }
+local AMOUNT_PATTERN = "^%s*%$?%s*%d[%d%.,]*%s*%a*%s*$"
+local cashLabelCache = nil
+local cashCacheAt = 0
+local cashCal = nil -- label hasil kalibrasi manual (kolom "Uang di layar")
+
+local function guiShown(d)
+    local p = d
+    while p do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("LayerCollector") and not p.Enabled then return false end
+        p = p.Parent
+    end
+    return true
+end
+
+-- skor label sebagai kandidat uang: posisi kiri-bawah layar (+10), nama memuat cash/money (+5)
+local function cashScore(d, vp)
+    local pos, size = d.AbsolutePosition, d.AbsoluteSize
+    local cx, cy = (pos.X + size.X / 2) / vp.X, (pos.Y + size.Y / 2) / vp.Y
+    local score = 0
+    if cx < 0.4 and cy > 0.75 then score += 10 end
+    if containsAny(d.Name, CASH_NAMES) then score += 5 end
+    score += math.min(d.TextSize, 60) / 100
+    return score, cx, cy
+end
+
+-- Kandidat: label angka murni yang tampak di layar. Di kiri-bawah dipilih NILAI TERBESAR
+-- (dompet selalu lebih besar dari label kecil lain seperti hadiah/popup); jika tidak ada, nilai terbesar di layar.
+local function findCashLabel()
+    local pg = player:FindFirstChild("PlayerGui")
+    local cam = workspace.CurrentCamera
+    if not pg or not cam then return nil end
+    local vp = cam.ViewportSize
+    if vp.X <= 0 or vp.Y <= 0 then return nil end
+    local bestLeft, bestLeftVal = nil, 0
+    local bestAny, bestAnyVal = nil, 0
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and string.match(d.Text, AMOUNT_PATTERN) and guiShown(d) then
+            local n = parseAmount(d.Text)
+            if n and n > 0 and d.AbsoluteSize.X > 1 and d.TextTransparency < 0.95
+                and not containsAny(d.Name, { "price", "cost", "reward", "bonus" }) then
+                local _, cx, cy = cashScore(d, vp)
+                if cx >= 0 and cx <= 1 and cy >= 0 and cy <= 1 then
+                    if cx < 0.4 and cy > 0.75 and n > bestLeftVal then bestLeft, bestLeftVal = d, n end
+                    if n > bestAnyVal then bestAny, bestAnyVal = d, n end
+                end
+            end
+        end
+    end
+    return bestLeft or bestAny
+end
+
 local function getCash()
+    if cashCal and cashCal.Parent then
+        local n = parseAmount(cashCal.Text)
+        if n and n > 0 then return n, "kalibrasi: " .. cashCal.Name end
+    end
+    local cached = cashLabelCache
+    if cached and cached.Parent and guiShown(cached) and os.clock() - cashCacheAt < 5 then
+        local n = parseAmount(cached.Text)
+        if n and n > 0 then return n, "label " .. cached.Name end
+    end
+    cashLabelCache = findCashLabel()
+    cashCacheAt = os.clock()
+    if cashLabelCache then
+        local n = parseAmount(cashLabelCache.Text)
+        if n and n > 0 then return n, "label " .. cashLabelCache.Name end
+    end
     for _, k in ipairs({ "Cash", "Money", "Coins" }) do
         local a = player:GetAttribute(k)
         if type(a) == "number" then return a, "atribut " .. k end
@@ -1475,17 +1548,7 @@ local function getCash()
     for _, root in ipairs({ player, player:FindFirstChild("leaderstats") }) do
         for _, d in ipairs(root:GetChildren()) do
             if (d:IsA("NumberValue") or d:IsA("IntValue")) and containsAny(d.Name, CASH_NAMES) then
-                return d.Value, "value " .. d:GetFullName()
-            end
-        end
-    end
-    local pg = player:FindFirstChild("PlayerGui")
-    if pg then
-        for _, d in ipairs(pg:GetDescendants()) do
-            if d:IsA("TextLabel") and containsAny(d.Name, CASH_NAMES) and d.Visible
-                and not string.find(d.Text, "/", 1, true) and not string.find(d.Text, "%dx") then
-                local n = parseAmount(d.Text)
-                if n and n > 0 then return n, "gui " .. d:GetFullName() end
+                return d.Value, "value " .. d.Name
             end
         end
     end
@@ -1616,10 +1679,14 @@ local function runLevelProcedure(hit)
         if not mutation then return failLevel(1, "mutasi box tidak terbaca") end
         local price = readBoxPrice(inst)
         if not price then return failLevel(1, "harga box tidak terbaca") end
-        local cash = getCash()
-        if not cash then return failLevel(1, "uang tidak terbaca (lihat Debug)") end
-        if cash < price * levelMult then
-            return failLevel(1, "uang kurang (" .. formatAmount(cash) .. " < " .. levelMult .. "x " .. formatAmount(price) .. ")")
+        if levelMult > 0 then
+            local cash = getCash()
+            if not cash then
+                return failLevel(1, "uang tidak terbaca (isi 'Uang min' = 0 untuk melewati cek, atau lihat Debug)")
+            end
+            if cash < price * levelMult then
+                return failLevel(1, "uang kurang (" .. formatAmount(cash) .. " < " .. levelMult .. "x " .. formatAmount(price) .. ")")
+            end
         end
         local rBuy = getRemote("PurchaseConveyorRoll")
         if not rBuy then return failLevel(1, "remote PurchaseConveyorRoll tidak ada") end
@@ -1753,13 +1820,44 @@ end)
 
 multBox.FocusLost:Connect(function()
     local n = tonumber(multBox.Text)
-    if n and n >= 1 then levelMult = n end
+    if n and n >= 0 then levelMult = n end
     multBox.Text = tostring(levelMult)
 end)
 lvlBox.FocusLost:Connect(function()
     local n = tonumber(lvlBox.Text)
     if n and n >= 1 then levelTarget = math.floor(n) end
     lvlBox.Text = tostring(levelTarget)
+end)
+calBox.FocusLost:Connect(function()
+    if calBox.Text == "" then
+        cashCal = nil
+        levelStatus = "kalibrasi uang dihapus (otomatis)"
+        return
+    end
+    local target = parseAmount(calBox.Text)
+    if not target then
+        levelStatus = "angka kalibrasi tidak valid (contoh: 598.05T)"
+        return
+    end
+    local pg = player:FindFirstChild("PlayerGui")
+    local bestL, bestDiff = nil, nil
+    if pg then
+        for _, d in ipairs(pg:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and string.match(d.Text, AMOUNT_PATTERN) and guiShown(d) then
+                local n = parseAmount(d.Text)
+                if n and n > 0 then
+                    local diff = math.abs(n - target) / target
+                    if diff < 0.02 and (not bestDiff or diff < bestDiff) then bestL, bestDiff = d, diff end
+                end
+            end
+        end
+    end
+    if bestL then
+        cashCal = bestL
+        levelStatus = "uang terkalibrasi: " .. bestL:GetFullName()
+    else
+        levelStatus = "tidak ada label dengan nilai itu (samakan dengan angka di layar)"
+    end
 end)
 protectBox.FocusLost:Connect(function()
     local n = tonumber(protectBox.Text)
@@ -1770,9 +1868,9 @@ end)
 task.spawn(function()
     while alive and gui.Parent do
         if levelPage.Visible and not minimized then
-            local cash = getCash()
+            local cash, csrc = getCash()
             levelInfo.Text = table.concat({
-                "Uang: " .. (cash and formatAmount(cash) or "tidak terbaca"),
+                "Uang: " .. (cash and (formatAmount(cash) .. " (" .. tostring(csrc) .. ")") or "tidak terbaca"),
                 levelStatus,
                 "Selesai: " .. levelCount .. " siklus",
                 "Terakhir: " .. levelLast,
@@ -1953,12 +2051,15 @@ debugBtn.MouseButton1Click:Connect(function()
     local pgui = player:FindFirstChild("PlayerGui")
     if pgui then
         local cc = 0
-        table.insert(lines, "Label angka di PlayerGui (kandidat uang, maks 15):")
+        local camVp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1, 1)
+        table.insert(lines, "Label uang terpilih: " .. (cashLabelCache and (cashLabelCache:GetFullName() .. " = " .. cashLabelCache.Text) or "-"))
+        table.insert(lines, "Label angka di PlayerGui (kandidat uang, maks 20):")
         for _, d in ipairs(pgui:GetDescendants()) do
-            if cc >= 15 then break end
-            if d:IsA("TextLabel") and d.Visible and string.match(d.Text, "^%$?%s*[%d%.,]+%s*%a*$") then
+            if cc >= 20 then break end
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and guiShown(d) and string.match(d.Text, AMOUNT_PATTERN) then
                 cc += 1
-                table.insert(lines, "  " .. d:GetFullName() .. " | " .. d.Text)
+                local sc, cx, cy = cashScore(d, camVp)
+                table.insert(lines, string.format("  %s | %s | x=%.2f y=%.2f skor=%.2f", d:GetFullName(), d.Text, cx, cy, sc))
             end
         end
     end

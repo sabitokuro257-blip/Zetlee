@@ -72,6 +72,10 @@ local WALK_FALLBACK_TP = true -- mode Jalan: jika macet/tidak sampai, lanjut den
 local TP_STAY = 0.35         -- jeda di lokasi item sebelum mengambil, agar posisi terkirim ke server (detik)
 local CONFIRM_WAIT = 0.6     -- lama menunggu server menandai item sudah diambil (Occupied = false)
 
+-- Auto level up
+local LEVEL_OPEN_TIMEOUT = 900 -- batas menunggu countdown box sampai terbuka (detik)
+local LEVEL_UP_TIMEOUT = 600   -- batas waktu level up sampai level target (detik)
+
 ---------------------------------------------------------------------
 -- REMOTE
 ---------------------------------------------------------------------
@@ -95,7 +99,7 @@ local ignoredSig = setmetatable({}, { __mode = "k" }) -- [instance] = "Box|Mutas
 local alive = true
 local minimized = false
 local selected = {}    -- box terpilih
-local selectedVar = {} -- mutasi terpilih
+local selectedVar = {} -- mutasi terpilih per box: selectedVar[box][mutasi] = true/false
 
 local collectOn = false
 local collectMode = "walk" -- "walk" | "tp"
@@ -105,6 +109,16 @@ local collectCount = 0
 local collectTried = 0
 local actionText = "menunggu item"
 local lastItemCount = 0
+
+local levelOn = false
+local levelBusy = false
+local levelMult = 3      -- uang minimal = levelMult x harga box
+local levelTarget = 50   -- level target unit baru
+local levelProtect = 5   -- jumlah unit income tertinggi yang tidak boleh dikeluarkan
+local levelStatus = "idle"
+local levelLast = "-"
+local levelCount = 0
+local levelCooldownUntil = 0
 
 local function buildTerms(names, aliases)
     local t = {}
@@ -116,14 +130,19 @@ local function buildTerms(names, aliases)
 end
 local TERMS = buildTerms(BOXES, ALIASES)
 local VTERMS = buildTerms(VARIANTS, VARIANT_ALIASES)
-for _, n in ipairs(BOXES) do selected[n] = false end
-for _, n in ipairs(VARIANTS) do selectedVar[n] = false end
+for _, n in ipairs(BOXES) do
+    selected[n] = false
+    selectedVar[n] = {}
+    for _, v in ipairs(VARIANTS) do selectedVar[n][v] = false end
+end
 
-local function anyVariantSelected()
+-- jumlah mutasi yang dipilih untuk sebuah box (0 = semua mutasi dianggap cocok)
+local function boxVarCount(box)
+    local n = 0
     for _, v in ipairs(VARIANTS) do
-        if selectedVar[v] then return true end
+        if selectedVar[box][v] then n += 1 end
     end
-    return false
+    return n
 end
 
 ---------------------------------------------------------------------
@@ -299,7 +318,7 @@ local function variantContainer(inst)
         or inst.Parent
 end
 
-local function variantMatches(inst, onlySelected)
+local function variantMatches(inst, onlySelected, box)
     local c = variantContainer(inst)
     if not c then return nil end
     local texts = {}
@@ -317,7 +336,7 @@ local function variantMatches(inst, onlySelected)
         end
     end
     for _, v in ipairs(VARIANTS) do
-        if not onlySelected or selectedVar[v] then
+        if not onlySelected or selectedVar[box][v] then
             for _, term in ipairs(VTERMS[v]) do
                 for _, t in ipairs(texts) do
                     if textHas(t, term) then return v end
@@ -331,7 +350,6 @@ end
 -- return hits, jumlah area, peta jenis box yang terlihat { [box] = { [mutasi] = true } }
 local function scanConveyor(useIgnore)
     local hits, seenNames, dedupe = {}, {}, {}
-    local hasVarFilter = anyVariantSelected()
     local roots = getScopes(false)
     for _, root in ipairs(roots) do
         local list = root:GetDescendants()
@@ -350,8 +368,8 @@ local function scanConveyor(useIgnore)
                         if selBox then
                             local varSel = nil
                             local pass = true
-                            if hasVarFilter then
-                                varSel = variantMatches(d, true)
+                            if boxVarCount(selBox) > 0 then
+                                varSel = variantMatches(d, true, selBox)
                                 pass = varSel ~= nil
                             end
                             if pass then
@@ -375,7 +393,7 @@ local function isLive(h)
     if not selected[h.name] then return false end
     if not valid(inst) then return false end
     if matchBox(inst, false) ~= h.name then return false end
-    if h.variant and variantMatches(inst, true) ~= h.variant then return false end
+    if h.variant and variantMatches(inst, true, h.name) ~= h.variant then return false end
     return true
 end
 
@@ -502,10 +520,11 @@ seenLabel.Parent = body
 local debugBtn = makeButton("Debug", Color3.fromRGB(80, 60, 110), UDim2.new(0, 74, 0, 22), UDim2.new(1, -82, 0, 29))
 
 -- Tab: Box | Mutasi | Reset
-local tabBox = makeButton("Box", Color3.fromRGB(60, 90, 160), UDim2.new(0, 56, 0, 22), UDim2.new(0, 8, 0, 56), 12)
-local tabVar = makeButton("Mutasi", Color3.fromRGB(55, 55, 70), UDim2.new(0, 62, 0, 22), UDim2.new(0, 70, 0, 56), 12)
-local tabItem = makeButton("Item", Color3.fromRGB(55, 55, 70), UDim2.new(0, 50, 0, 22), UDim2.new(0, 138, 0, 56), 12)
-local resetBtn = makeButton("Reset", Color3.fromRGB(150, 60, 60), UDim2.new(0, 56, 0, 22), UDim2.new(0, 194, 0, 56), 12)
+local tabBox = makeButton("Box", Color3.fromRGB(60, 90, 160), UDim2.new(0, 44, 0, 22), UDim2.new(0, 8, 0, 56), 11)
+local tabVar = makeButton("Mutasi", Color3.fromRGB(55, 55, 70), UDim2.new(0, 52, 0, 22), UDim2.new(0, 54, 0, 56), 11)
+local tabItem = makeButton("Item", Color3.fromRGB(55, 55, 70), UDim2.new(0, 42, 0, 22), UDim2.new(0, 108, 0, 56), 11)
+local tabLevel = makeButton("Level", Color3.fromRGB(55, 55, 70), UDim2.new(0, 46, 0, 22), UDim2.new(0, 152, 0, 56), 11)
+local resetBtn = makeButton("Reset", Color3.fromRGB(150, 60, 60), UDim2.new(0, 50, 0, 22), UDim2.new(0, 200, 0, 56), 11)
 
 local function makeList()
     local sf = Instance.new("ScrollingFrame")
@@ -525,8 +544,37 @@ local function makeList()
 end
 
 local boxList = makeList()
-local varList = makeList()
-varList.Visible = false
+
+-- Halaman Mutasi: pilih box (‹ ›), lalu atur mutasi khusus untuk box itu
+local varPage = Instance.new("Frame")
+varPage.Size = UDim2.new(1, -16, 1, -88)
+varPage.Position = UDim2.new(0, 8, 0, 82)
+varPage.BackgroundTransparency = 1
+varPage.Visible = false
+varPage.Parent = body
+
+local varPrev = makeButton("<", Color3.fromRGB(70, 70, 90), UDim2.new(0, 30, 0, 26), UDim2.new(0, 0, 0, 0), 14)
+local varTitle = makeButton("", Color3.fromRGB(55, 55, 70), UDim2.new(1, -136, 0, 26), UDim2.new(0, 34, 0, 0), 12)
+local varNext = makeButton(">", Color3.fromRGB(70, 70, 90), UDim2.new(0, 30, 0, 26), UDim2.new(1, -98, 0, 0), 14)
+local varClear = makeButton("Kosongkan", Color3.fromRGB(150, 60, 60), UDim2.new(0, 64, 0, 26), UDim2.new(1, -64, 0, 0), 10)
+for _, b in ipairs({ varPrev, varTitle, varNext, varClear }) do b.Parent = varPage end
+varTitle.TextTruncate = Enum.TextTruncate.AtEnd
+
+local varList = Instance.new("ScrollingFrame")
+varList.Size = UDim2.new(1, 0, 1, -30)
+varList.Position = UDim2.new(0, 0, 0, 30)
+varList.BackgroundTransparency = 1
+varList.BorderSizePixel = 0
+varList.ScrollBarThickness = 4
+varList.CanvasSize = UDim2.new(0, 0, 0, 0)
+varList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+varList.Parent = varPage
+do
+    local vl = Instance.new("UIListLayout")
+    vl.Padding = UDim.new(0, 4)
+    vl.SortOrder = Enum.SortOrder.LayoutOrder
+    vl.Parent = varList
+end
 
 -- Halaman Item
 local itemPage = Instance.new("Frame")
@@ -588,17 +636,82 @@ itemInfo.TextColor3 = Color3.fromRGB(200, 200, 210)
 itemInfo.Text = "Base: belum diset"
 itemInfo.Parent = itemPage
 
+-- Halaman Level (auto level up)
+local levelPage = Instance.new("Frame")
+levelPage.Size = UDim2.new(1, -16, 1, -88)
+levelPage.Position = UDim2.new(0, 8, 0, 82)
+levelPage.BackgroundTransparency = 1
+levelPage.Visible = false
+levelPage.Parent = body
+do
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, 5)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Parent = levelPage
+end
+
+local levelToggle = pageButton(levelPage, "  Auto Level Up  [OFF]", 1)
+
+local function inputRow(order, labelText, default)
+    local row = Instance.new("Frame")
+    row.LayoutOrder = order
+    row.Size = UDim2.new(1, -6, 0, 26)
+    row.BackgroundTransparency = 1
+    row.Parent = levelPage
+    local lab = Instance.new("TextLabel")
+    lab.Size = UDim2.new(1, -74, 1, 0)
+    lab.BackgroundTransparency = 1
+    lab.Text = labelText
+    lab.TextColor3 = Color3.fromRGB(200, 200, 210)
+    lab.Font = Enum.Font.Gotham
+    lab.TextSize = 12
+    lab.TextXAlignment = Enum.TextXAlignment.Left
+    lab.TextTruncate = Enum.TextTruncate.AtEnd
+    lab.Parent = row
+    local tb = Instance.new("TextBox")
+    tb.Size = UDim2.new(0, 68, 1, 0)
+    tb.Position = UDim2.new(1, -68, 0, 0)
+    tb.BackgroundColor3 = Color3.fromRGB(55, 55, 70)
+    tb.TextColor3 = Color3.new(1, 1, 1)
+    tb.Font = Enum.Font.GothamBold
+    tb.TextSize = 13
+    tb.ClearTextOnFocus = false
+    tb.Text = tostring(default)
+    tb.Parent = row
+    Instance.new("UICorner", tb).CornerRadius = UDim.new(0, 5)
+    return tb
+end
+local multBox = inputRow(2, "Uang min (x harga box)", levelMult)
+local lvlBox = inputRow(3, "Level target unit", levelTarget)
+local protectBox = inputRow(4, "Unit teratas dilindungi", levelProtect)
+
+local levelInfo = Instance.new("TextLabel")
+levelInfo.LayoutOrder = 5
+levelInfo.Size = UDim2.new(1, -6, 0, 104)
+levelInfo.BackgroundTransparency = 1
+levelInfo.TextWrapped = true
+levelInfo.TextXAlignment = Enum.TextXAlignment.Left
+levelInfo.TextYAlignment = Enum.TextYAlignment.Top
+levelInfo.Font = Enum.Font.Gotham
+levelInfo.TextSize = 12
+levelInfo.TextColor3 = Color3.fromRGB(200, 200, 210)
+levelInfo.Text = "idle"
+levelInfo.Parent = levelPage
+
 local function showTab(which)
     boxList.Visible = (which == "box")
-    varList.Visible = (which == "var")
+    varPage.Visible = (which == "var")
     itemPage.Visible = (which == "item")
+    levelPage.Visible = (which == "level")
     tabBox.BackgroundColor3 = (which == "box") and Color3.fromRGB(60, 90, 160) or Color3.fromRGB(55, 55, 70)
     tabVar.BackgroundColor3 = (which == "var") and Color3.fromRGB(60, 90, 160) or Color3.fromRGB(55, 55, 70)
     tabItem.BackgroundColor3 = (which == "item") and Color3.fromRGB(60, 90, 160) or Color3.fromRGB(55, 55, 70)
+    tabLevel.BackgroundColor3 = (which == "level") and Color3.fromRGB(60, 90, 160) or Color3.fromRGB(55, 55, 70)
 end
 tabBox.MouseButton1Click:Connect(function() showTab("box") end)
 tabVar.MouseButton1Click:Connect(function() showTab("var") end)
 tabItem.MouseButton1Click:Connect(function() showTab("item") end)
+tabLevel.MouseButton1Click:Connect(function() showTab("level") end)
 
 local function setStatus(text)
     status.Text = "Status: " .. text
@@ -610,6 +723,8 @@ end
 
 local boxButtons, varButtons = {}, {}
 local boxIndex, varIndex = {}, {}
+local boxCfgButtons = {}
+local configBox = BOXES[1] -- box yang sedang diatur mutasinya
 
 local function refreshBtn(btn, i, name, on)
     btn.Text = "  " .. i .. ". " .. name .. (on and "  [ON]" or "  [OFF]")
@@ -622,14 +737,31 @@ local function baseline()
     ignoreHits(hits)
 end
 
+local function varBadge(box)
+    local n = boxVarCount(box)
+    return n == 0 and "Mutasi" or ("Mutasi:" .. n)
+end
+
+local function refreshVarPage()
+    local n = boxVarCount(configBox)
+    varTitle.Text = configBox .. (n == 0 and " (semua mutasi)" or (" (" .. n .. " mutasi)"))
+    styleToggle(varTitle, selected[configBox])
+    for i, v in ipairs(VARIANTS) do
+        if varButtons[v] then refreshBtn(varButtons[v], i, v, selectedVar[configBox][v]) end
+    end
+    if boxCfgButtons[configBox] then boxCfgButtons[configBox].Text = varBadge(configBox) end
+end
+
 local function setBox(name, on)
     selected[name] = on
     refreshBtn(boxButtons[name], boxIndex[name], name, on)
+    if name == configBox then refreshVarPage() end
 end
 
-local function setVariant(name, on)
-    selectedVar[name] = on
-    refreshBtn(varButtons[name], varIndex[name], name, on)
+local function openVarPage(name)
+    configBox = name
+    refreshVarPage()
+    showTab("var")
 end
 
 local function makeToggle(parent, i, name, store, indexMap, onClick)
@@ -646,21 +778,66 @@ local function makeToggle(parent, i, name, store, indexMap, onClick)
     indexMap[name] = i
     refreshBtn(btn, i, name, false)
     btn.MouseButton1Click:Connect(onClick)
+    return btn
 end
 
+-- baris box: tombol pilih box + tombol "Mutasi" untuk mengatur mutasi khusus box itu
 for i, name in ipairs(BOXES) do
-    makeToggle(boxList, i, name, boxButtons, boxIndex, function()
+    local row = Instance.new("Frame")
+    row.LayoutOrder = i
+    row.Size = UDim2.new(1, -6, 0, 26)
+    row.BackgroundTransparency = 1
+    row.Parent = boxList
+
+    local btn = makeToggle(row, i, name, boxButtons, boxIndex, function()
         setBox(name, not selected[name])
         baseline()
     end)
+    btn.Size = UDim2.new(1, -62, 1, 0)
+
+    local cfg = Instance.new("TextButton")
+    cfg.Size = UDim2.new(0, 58, 1, 0)
+    cfg.Position = UDim2.new(1, -58, 0, 0)
+    cfg.BackgroundColor3 = Color3.fromRGB(70, 60, 110)
+    cfg.TextColor3 = Color3.new(1, 1, 1)
+    cfg.Font = Enum.Font.GothamBold
+    cfg.TextSize = 11
+    cfg.Text = varBadge(name)
+    cfg.Parent = row
+    Instance.new("UICorner", cfg).CornerRadius = UDim.new(0, 5)
+    boxCfgButtons[name] = cfg
+    cfg.MouseButton1Click:Connect(function() openVarPage(name) end)
 end
 
-for i, name in ipairs(VARIANTS) do
-    makeToggle(varList, i, name, varButtons, varIndex, function()
-        setVariant(name, not selectedVar[name])
+-- daftar mutasi (berlaku untuk configBox)
+for i, v in ipairs(VARIANTS) do
+    makeToggle(varList, i, v, varButtons, varIndex, function()
+        selectedVar[configBox][v] = not selectedVar[configBox][v]
+        refreshVarPage()
         baseline()
     end)
 end
+
+varPrev.MouseButton1Click:Connect(function()
+    local idx = table.find(BOXES, configBox) or 1
+    configBox = BOXES[((idx - 2) % #BOXES) + 1]
+    refreshVarPage()
+end)
+varNext.MouseButton1Click:Connect(function()
+    local idx = table.find(BOXES, configBox) or 1
+    configBox = BOXES[(idx % #BOXES) + 1]
+    refreshVarPage()
+end)
+varTitle.MouseButton1Click:Connect(function() -- ketuk judul = nyalakan/matikan box ini
+    setBox(configBox, not selected[configBox])
+    baseline()
+end)
+varClear.MouseButton1Click:Connect(function()
+    for _, v in ipairs(VARIANTS) do selectedVar[configBox][v] = false end
+    refreshVarPage()
+    baseline()
+end)
+refreshVarPage()
 
 ---------------------------------------------------------------------
 -- AUTO AMBIL ITEM
@@ -1245,6 +1422,366 @@ for _, r in ipairs(Remotes:GetChildren()) do
     end
 end
 
+---------------------------------------------------------------------
+-- AUTO LEVEL UP
+-- Urutan wajib: 1 beli box -> 2 keluarkan unit income terendah -> 3 taruh box -> 4 buka box
+--               -> 5 level up -> 6 equip best. Jika satu langkah gagal, langkah berikutnya tidak jalan.
+---------------------------------------------------------------------
+local AMOUNT_SUFFIX = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qi = 1e18, sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30, dc = 1e33 }
+local SUFFIX_ORDER = {
+    { 1e33, "Dc" }, { 1e30, "No" }, { 1e27, "Oc" }, { 1e24, "Sp" }, { 1e21, "Sx" },
+    { 1e18, "Qi" }, { 1e15, "Qa" }, { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" },
+}
+
+-- "$4.41B/Drop" -> 4.41e9 ; "36.13T" -> 36.13e12 ; nil jika bukan angka
+local function parseAmount(text)
+    local num, suf = string.match(text, "(%d[%d%.,]*)%s*(%a*)")
+    if not num then return nil end
+    num = string.gsub(num, ",", "")
+    local n = tonumber(num)
+    if not n then return nil end
+    suf = string.lower(suf or "")
+    if suf == "" then return n end
+    local m = AMOUNT_SUFFIX[suf]
+    if not m then return nil end
+    return n * m
+end
+
+local function formatAmount(n)
+    if not n then return "?" end
+    for _, pr in ipairs(SUFFIX_ORDER) do
+        if n >= pr[1] then return string.format("%.2f%s", n / pr[1], pr[2]) end
+    end
+    return tostring(math.floor(n))
+end
+
+local function parseCountdown(text)
+    local h, m, sec = string.match(text, "(%d+):(%d+):(%d+)")
+    if h then return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(sec) end
+    m, sec = string.match(text, "(%d+):(%d+)")
+    if m then return tonumber(m) * 60 + tonumber(sec) end
+    local only = string.match(text, "^%s*(%d+)%s*[sS]%s*$")
+    if only then return tonumber(only) end
+    return nil
+end
+
+-- uang pemain: atribut -> Value di bawah pemain (leaderstats) -> label PlayerGui bernama cash/money
+local CASH_NAMES = { "cash", "money", "coins" }
+local function getCash()
+    for _, k in ipairs({ "Cash", "Money", "Coins" }) do
+        local a = player:GetAttribute(k)
+        if type(a) == "number" then return a, "atribut " .. k end
+    end
+    for _, root in ipairs({ player, player:FindFirstChild("leaderstats") }) do
+        for _, d in ipairs(root:GetChildren()) do
+            if (d:IsA("NumberValue") or d:IsA("IntValue")) and containsAny(d.Name, CASH_NAMES) then
+                return d.Value, "value " .. d:GetFullName()
+            end
+        end
+    end
+    local pg = player:FindFirstChild("PlayerGui")
+    if pg then
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d:IsA("TextLabel") and containsAny(d.Name, CASH_NAMES) and d.Visible
+                and not string.find(d.Text, "/", 1, true) and not string.find(d.Text, "%dx") then
+                local n = parseAmount(d.Text)
+                if n and n > 0 then return n, "gui " .. d:GetFullName() end
+            end
+        end
+    end
+    return nil, nil
+end
+
+-- harga box dari atribut Price/Cost, atau teks berawalan $ di GUI box
+local function readBoxPrice(inst)
+    local c = variantContainer(inst)
+    for _, o in ipairs({ inst, c }) do
+        for _, key in ipairs({ "Price", "Cost" }) do
+            local a = o and o:GetAttribute(key)
+            if type(a) == "number" then return a end
+        end
+    end
+    local best = nil
+    local list = c and c:GetDescendants() or {}
+    if c then table.insert(list, c) end
+    for _, d in ipairs(list) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and string.find(d.Text, "%$") and isVisible(d) then
+            local n = parseAmount(d.Text)
+            if n and (not best or n > best) then best = n end
+        end
+    end
+    return best
+end
+
+local function getDroppers()
+    local out = {}
+    local plot = getPlot()
+    if not plot then return out end
+    local tc = plot:FindFirstChild("TycoonConveyor", true)
+    local conveyors = tc and tc:FindFirstChild("Conveyors")
+    if not conveyors then return out end
+    for _, conv in ipairs(conveyors:GetChildren()) do
+        local dr = conv:FindFirstChild("Droppers")
+        if dr then
+            for _, d in ipairs(dr:GetChildren()) do table.insert(out, d) end
+        end
+    end
+    return out
+end
+
+-- kind: "empty" | "box" (box sedang countdown) | "unit"
+local function dropperInfo(d)
+    local info = { dropper = d, kind = "empty", income = 0, level = 0, countdown = nil }
+    local boxModel = d:FindFirstChild("BoxModel")
+    if boxModel then
+        info.kind = "box"
+        for _, t in ipairs(boxModel:GetDescendants()) do
+            if t:IsA("TextLabel") and t.Text ~= "" then
+                local cd = parseCountdown(t.Text)
+                if cd then info.countdown = cd break end
+            end
+        end
+        return info
+    end
+    for _, c in ipairs(d:GetChildren()) do
+        if c:IsA("Model") and c.Name ~= "DropperTemplate" and c.Name ~= "BoxModel" then
+            info.unit = c
+            info.kind = "unit"
+            break
+        end
+    end
+    if info.kind == "unit" then
+        local bb = d:FindFirstChild("PlayerUnitShowcaseBillboard", true)
+        if bb then
+            for _, t in ipairs(bb:GetDescendants()) do
+                if t:IsA("TextLabel") and t.Text ~= "" then
+                    local low = string.lower(t.Text)
+                    local lv = string.match(low, "level%s*(%d+)") or string.match(low, "lv%.?%s*(%d+)")
+                    if lv then info.level = tonumber(lv) end
+                    if string.find(low, "/drop", 1, true) or string.find(low, "/s", 1, true) then
+                        local n = parseAmount(t.Text)
+                        if n then info.income = n end
+                    end
+                end
+            end
+        end
+    end
+    return info
+end
+
+local function invokeTimeout(remote, timeout, ...)
+    local args = table.pack(...)
+    local done, res = false, nil
+    task.spawn(function()
+        local ok, r = pcall(function()
+            return remote:InvokeServer(table.unpack(args, 1, args.n))
+        end)
+        res = ok and r or nil
+        done = true
+    end)
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < timeout do task.wait(0.05) end
+    return done, res
+end
+
+local function waitUntil(fn, timeout, interval)
+    local t0 = os.clock()
+    while os.clock() - t0 < timeout do
+        if not levelOn then return false end
+        if fn() then return true end
+        task.wait(interval or 0.2)
+    end
+    return fn() and true or false
+end
+
+local function setLevelStep(n, text)
+    levelStatus = string.format("Langkah %d/6: %s", n, text)
+end
+
+local function failLevel(step, reason)
+    levelLast = string.format("gagal di langkah %d: %s", step, reason)
+    levelStatus = levelLast
+    levelCooldownUntil = os.clock() + 20
+    return false
+end
+
+local function runLevelProcedure(hit)
+    levelBusy = true
+    local ok, err = pcall(function()
+        local inst = hit.inst
+
+        -- 1. beli box (uang harus >= levelMult x harga)
+        setLevelStep(1, "membeli " .. hit.name)
+        local mutation = variantMatches(inst, nil)
+        if not mutation then return failLevel(1, "mutasi box tidak terbaca") end
+        local price = readBoxPrice(inst)
+        if not price then return failLevel(1, "harga box tidak terbaca") end
+        local cash = getCash()
+        if not cash then return failLevel(1, "uang tidak terbaca (lihat Debug)") end
+        if cash < price * levelMult then
+            return failLevel(1, "uang kurang (" .. formatAmount(cash) .. " < " .. levelMult .. "x " .. formatAmount(price) .. ")")
+        end
+        local rBuy = getRemote("PurchaseConveyorRoll")
+        if not rBuy then return failLevel(1, "remote PurchaseConveyorRoll tidak ada") end
+        rBuy:FireServer(hit.name, mutation, math.floor(price + 0.5))
+        if not waitUntil(function() return not isLive(hit) end, 4, 0.2) then
+            return failLevel(1, "pembelian tidak terkonfirmasi")
+        end
+
+        -- 2. siapkan slot: pakai dropper kosong, atau keluarkan unit income terendah (top N dilindungi)
+        setLevelStep(2, "mencari slot")
+        local infos = {}
+        for _, d in ipairs(getDroppers()) do table.insert(infos, dropperInfo(d)) end
+        if #infos == 0 then return failLevel(2, "dropper tidak ditemukan") end
+        local target = nil
+        for _, i in ipairs(infos) do
+            if i.kind == "empty" then target = i break end
+        end
+        if not target then
+            local units = {}
+            for _, i in ipairs(infos) do
+                if i.kind == "unit" then
+                    if i.income <= 0 then
+                        return failLevel(2, "income unit " .. i.dropper.Name .. " tidak terbaca (tidak ada yang dihapus)")
+                    end
+                    table.insert(units, i)
+                end
+            end
+            table.sort(units, function(a, b) return a.income > b.income end)
+            if #units <= levelProtect then
+                return failLevel(2, "tidak ada unit yang boleh dikeluarkan (" .. levelProtect .. " teratas dilindungi)")
+            end
+            local lowest = units[#units]
+            setLevelStep(2, "mengeluarkan unit dropper " .. lowest.dropper.Name .. " (" .. formatAmount(lowest.income) .. "/drop)")
+            local rRem = getRemote("RemovePlayerUnitFromDropper")
+            if not rRem then return failLevel(2, "remote RemovePlayerUnitFromDropper tidak ada") end
+            rRem:FireServer(lowest.dropper)
+            if not waitUntil(function() return dropperInfo(lowest.dropper).kind == "empty" end, 5, 0.2) then
+                return failLevel(2, "unit tidak keluar dari dropper")
+            end
+            target = lowest
+        end
+
+        -- 3. taruh box yang baru dibeli di slot itu
+        setLevelStep(3, "menaruh " .. hit.name .. " (" .. mutation .. ") di dropper " .. target.dropper.Name)
+        local rPlace = getRemote("PlaceBoxOnDropper")
+        if not rPlace then return failLevel(3, "remote PlaceBoxOnDropper tidak ada") end
+        rPlace:FireServer(target.dropper, hit.name, mutation)
+        if not waitUntil(function() return dropperInfo(target.dropper).kind == "box" end, 5, 0.2) then
+            return failLevel(3, "box tidak muncul di dropper")
+        end
+
+        -- 4. tunggu countdown, lalu buka box
+        local rOpen = getRemote("OpenBoxOnDropper")
+        if not rOpen then return failLevel(4, "remote OpenBoxOnDropper tidak ada") end
+        local t0, opened = os.clock(), false
+        while os.clock() - t0 < LEVEL_OPEN_TIMEOUT do
+            if not levelOn then return false end
+            local di = dropperInfo(target.dropper)
+            if di.kind == "unit" then opened = true break end
+            if di.countdown and di.countdown > 0 then
+                levelStatus = string.format("Langkah 4/6: menunggu countdown %ds", math.floor(di.countdown))
+                task.wait(1)
+            else
+                setLevelStep(4, "membuka box")
+                invokeTimeout(rOpen, 5, target.dropper)
+                if waitUntil(function() return dropperInfo(target.dropper).kind == "unit" end, 3, 0.2) then
+                    opened = true
+                    break
+                end
+                task.wait(2)
+            end
+        end
+        if not opened then return failLevel(4, "box tidak terbuka (timeout)") end
+
+        -- 5. level up unit baru sampai level target
+        local rLvl = getRemote("RequestPlayerUnitLevelUp")
+        if not rLvl then return failLevel(5, "remote RequestPlayerUnitLevelUp tidak ada") end
+        local lastLevel = dropperInfo(target.dropper).level
+        if lastLevel <= 0 then return failLevel(5, "level unit tidak terbaca (lihat Debug)") end
+        local tLv, noProgress = os.clock(), 0
+        while lastLevel < levelTarget do
+            if not levelOn then return false end
+            if os.clock() - tLv > LEVEL_UP_TIMEOUT then
+                return failLevel(5, "timeout di level " .. lastLevel .. " (uang kurang?)")
+            end
+            setLevelStep(5, "level " .. lastLevel .. "/" .. levelTarget)
+            rLvl:FireServer(target.dropper)
+            task.wait(0.15)
+            local cur = dropperInfo(target.dropper).level
+            if cur > lastLevel then
+                lastLevel, noProgress = cur, 0
+            else
+                noProgress += 1
+                if noProgress >= 10 then
+                    task.wait(3) -- tidak naik: mungkin uang belum cukup, tunggu sebentar
+                    noProgress = 0
+                end
+            end
+        end
+
+        -- 6. equip best (urutan unit dari income terendah ke tertinggi)
+        setLevelStep(6, "equip best")
+        local rEq = getRemote("EquipBestPlayerUnits")
+        if not rEq then return failLevel(6, "remote EquipBestPlayerUnits tidak ada") end
+        rEq:FireServer()
+        task.wait(0.5)
+        levelCount += 1
+        levelLast = "selesai: " .. hit.name .. " (" .. mutation .. ") di dropper " .. target.dropper.Name
+        levelStatus = levelLast
+        return true
+    end)
+    if not ok then
+        levelLast = "error: " .. tostring(err)
+        levelStatus = levelLast
+        levelCooldownUntil = os.clock() + 20
+    elseif not levelOn then
+        levelStatus = "dihentikan"
+    end
+    levelBusy = false
+end
+
+levelToggle.MouseButton1Click:Connect(function()
+    levelOn = not levelOn
+    levelToggle.Text = "  Auto Level Up  " .. (levelOn and "[ON]" or "[OFF]")
+    styleToggle(levelToggle, levelOn)
+    if levelOn then
+        levelStatus = "menunggu box terpilih dari auto roll"
+        levelCooldownUntil = 0
+    end
+end)
+
+multBox.FocusLost:Connect(function()
+    local n = tonumber(multBox.Text)
+    if n and n >= 1 then levelMult = n end
+    multBox.Text = tostring(levelMult)
+end)
+lvlBox.FocusLost:Connect(function()
+    local n = tonumber(lvlBox.Text)
+    if n and n >= 1 then levelTarget = math.floor(n) end
+    lvlBox.Text = tostring(levelTarget)
+end)
+protectBox.FocusLost:Connect(function()
+    local n = tonumber(protectBox.Text)
+    if n and n >= 0 then levelProtect = math.floor(n) end
+    protectBox.Text = tostring(levelProtect)
+end)
+
+task.spawn(function()
+    while alive and gui.Parent do
+        if levelPage.Visible and not minimized then
+            local cash = getCash()
+            levelInfo.Text = table.concat({
+                "Uang: " .. (cash and formatAmount(cash) or "tidak terbaca"),
+                levelStatus,
+                "Selesai: " .. levelCount .. " siklus",
+                "Terakhir: " .. levelLast,
+            }, "\n")
+        end
+        task.wait(1.5)
+    end
+end)
+
 autoBtn.MouseButton1Click:Connect(function()
     autoOn = not autoOn
     paused = false
@@ -1268,8 +1805,12 @@ end)
 resetBtn.MouseButton1Click:Connect(function()
     paused = false
     pausedHits = {}
-    for _, name in ipairs(BOXES) do setBox(name, false) end
-    for _, v in ipairs(VARIANTS) do setVariant(v, false) end
+    for _, name in ipairs(BOXES) do
+        setBox(name, false)
+        for _, v in ipairs(VARIANTS) do selectedVar[name][v] = false end
+        boxCfgButtons[name].Text = varBadge(name)
+    end
+    refreshVarPage()
     setStatus(autoOn and "pilihan direset, rolling..." or "pilihan direset")
 end)
 
@@ -1375,6 +1916,52 @@ debugBtn.MouseButton1Click:Connect(function()
     table.insert(lines, "Rintangan ditandai: sabuk=" .. obstacleStats.belts .. " bahaya=" .. obstacleStats.hazards)
     for _, nm in ipairs(obstacleSamples.belts) do table.insert(lines, "  sabuk: " .. nm) end
     for _, nm in ipairs(obstacleSamples.hazards) do table.insert(lines, "  bahaya: " .. nm) end
+    table.insert(lines, "Dropper (plot sendiri):")
+    for _, d in ipairs(getDroppers()) do
+        local di = dropperInfo(d)
+        local texts = {}
+        local src = d:FindFirstChild("PlayerUnitShowcaseBillboard", true) or d:FindFirstChild("BoxModel")
+        if src then
+            for _, t in ipairs(src:GetDescendants()) do
+                if t:IsA("TextLabel") and t.Text ~= "" then table.insert(texts, t.Name .. "=" .. t.Text) end
+            end
+        end
+        table.insert(lines, string.format("  %s | %s | unit=%s | income=%s | level=%s | countdown=%s | %s",
+            d.Name, di.kind, di.unit and di.unit.Name or "-", formatAmount(di.income), tostring(di.level),
+            tostring(di.countdown), table.concat(texts, "; ")))
+    end
+    local cashNow, cashSrc = getCash()
+    table.insert(lines, "Uang: " .. (cashNow and formatAmount(cashNow) or "TIDAK TERBACA") .. " | sumber=" .. tostring(cashSrc))
+    local ls = player:FindFirstChild("leaderstats")
+    if ls then
+        for _, v in ipairs(ls:GetChildren()) do
+            table.insert(lines, "  leaderstats: " .. v.Name .. " (" .. v.ClassName .. ")" .. (v:IsA("ValueBase") and (" = " .. tostring(v.Value)) or ""))
+        end
+    end
+    for k, v in pairs(player:GetAttributes()) do
+        table.insert(lines, "  atribut pemain: " .. k .. " = " .. tostring(v))
+    end
+    local bp = player:FindFirstChild("Backpack")
+    if bp then
+        for i, tool in ipairs(bp:GetChildren()) do
+            if i > 25 then break end
+            local at = {}
+            for k, v in pairs(tool:GetAttributes()) do table.insert(at, k .. "=" .. tostring(v)) end
+            table.insert(lines, "  tas: " .. tool.Name .. " (" .. tool.ClassName .. ") " .. table.concat(at, ","))
+        end
+    end
+    local pgui = player:FindFirstChild("PlayerGui")
+    if pgui then
+        local cc = 0
+        table.insert(lines, "Label angka di PlayerGui (kandidat uang, maks 15):")
+        for _, d in ipairs(pgui:GetDescendants()) do
+            if cc >= 15 then break end
+            if d:IsA("TextLabel") and d.Visible and string.match(d.Text, "^%$?%s*[%d%.,]+%s*%a*$") then
+                cc += 1
+                table.insert(lines, "  " .. d:GetFullName() .. " | " .. d.Text)
+            end
+        end
+    end
     local report = table.concat(lines, "\n")
     print(report)
     local copied = false
@@ -1470,6 +2057,11 @@ task.spawn(function()
                 pausedHits = {}
                 setStatus("rolling...")
             end
+        end
+
+        -- auto level up: beli box terpilih yang membuat auto roll berhenti
+        if levelOn and autoOn and paused and not levelBusy and os.clock() >= levelCooldownUntil and pausedHits[1] then
+            task.spawn(runLevelProcedure, pausedHits[1])
         end
 
         task.wait(ROLL_DELAY)

@@ -1433,10 +1433,10 @@ end
 -- Urutan wajib: 1 beli box -> 2 keluarkan unit income terendah -> 3 taruh box -> 4 buka box
 --               -> 5 level up -> 6 equip best. Jika satu langkah gagal, langkah berikutnya tidak jalan.
 ---------------------------------------------------------------------
-local AMOUNT_SUFFIX = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qi = 1e18, sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30, dc = 1e33 }
+local AMOUNT_SUFFIX = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qd = 1e15, qi = 1e18, qn = 1e18, sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30, dc = 1e33 }
 local SUFFIX_ORDER = {
     { 1e33, "Dc" }, { 1e30, "No" }, { 1e27, "Oc" }, { 1e24, "Sp" }, { 1e21, "Sx" },
-    { 1e18, "Qi" }, { 1e15, "Qa" }, { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" },
+    { 1e18, "Qn" }, { 1e15, "Qd" }, { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" },
 }
 
 -- "$4.41B/Drop" -> 4.41e9 ; "36.13T" -> 36.13e12 ; nil jika bukan angka
@@ -1473,6 +1473,7 @@ end
 
 -- uang pemain: label uang yang tampil di layar (kiri bawah) -> atribut -> Value di bawah pemain
 local CASH_NAMES = { "cash", "money", "coins" }
+local CASH_LABEL_PATH = { "FrontGui", "LeftBottomFrame", "CashHolder", "ImageLabel", "AmountLabel" }
 local AMOUNT_PATTERN = "^%s*%$?%s*%d[%d%.,]*%s*%a*%s*$"
 local cashLabelCache = nil
 local cashCacheAt = 0
@@ -1529,6 +1530,15 @@ local function getCash()
     if cashCal and cashCal.Parent then
         local n = parseAmount(cashCal.Text)
         if n and n > 0 then return n, "kalibrasi: " .. cashCal.Name end
+    end
+    -- label dompet game ini (jalur diketahui dari laporan Debug)
+    local node = player:FindFirstChild("PlayerGui")
+    for _, nm in ipairs(CASH_LABEL_PATH) do
+        node = node and node:FindFirstChild(nm)
+    end
+    if node and node:IsA("TextLabel") then
+        local n = parseAmount(node.Text)
+        if n and n > 0 then return n, "label dompet" end
     end
     local cached = cashLabelCache
     if cached and cached.Parent and guiShown(cached) and os.clock() - cashCacheAt < 5 then
